@@ -23,7 +23,11 @@ export
     arraydata,
     axisnames,
     get_num_sets,
-    get_RGB_channel_count
+    get_RGB_channel_count,
+    get_bf_path,
+    default_bf_path,
+    is_available,
+    download_bioformats!
 
 include("metadata.jl")
 include("omexmlreader.jl")
@@ -291,7 +295,78 @@ function enableLogging(level::String)
     Bool(jcall(dt,"enableLogging",jboolean,(JString,),level))
 end
 
-get_bf_path() = joinpath(dirname(@__DIR__), "deps", "bioformats_package.jar")
+"""
+    default_bf_path() -> String
+
+Preferred location for `bioformats_package.jar`: `bioformats/bioformats_package.jar`
+under the first entry of `Base.DEPOT_PATH`. This is the location
+`download_bioformats!` writes to, and (unless overridden, see [`get_bf_path`](@ref))
+the location `get_bf_path` resolves to.
+"""
+default_bf_path() = joinpath(Base.DEPOT_PATH[1], "bioformats", "bioformats_package.jar")
+
+# Legacy location: next to the package itself, filled in by the old
+# `Pkg.build`-time download (pre-dating `default_bf_path`/`download_bioformats!`).
+_legacy_bf_path() = joinpath(dirname(@__DIR__), "deps", "bioformats_package.jar")
+
+"""
+    get_bf_path() -> String
+
+Resolve the path to `bioformats_package.jar`, checked in order:
+1. The `BIOFORMATS_JAR_PATH` environment variable, if set and pointing at an
+   existing file.
+2. [`default_bf_path()`](@ref) (the Julia depot), if the file exists there.
+3. The legacy package-local `deps/bioformats_package.jar` path, if it exists
+   there (back-compat with the old `Pkg.build`-time download).
+
+Falls back to [`default_bf_path()`](@ref) if none of the above exist, so
+callers get a consistent target path to download to. Use [`is_available`](@ref)
+to check whether the resolved path actually exists.
+"""
+function get_bf_path()
+    env = get(ENV, "BIOFORMATS_JAR_PATH", "")
+    !isempty(env) && isfile(env) && return env
+    isfile(default_bf_path()) && return default_bf_path()
+    isfile(_legacy_bf_path()) && return _legacy_bf_path()
+    return default_bf_path()
+end
+
+"""
+    is_available() -> Bool
+
+Whether `bioformats_package.jar` currently exists at the path [`get_bf_path`](@ref)
+resolves to.
+"""
+is_available() = isfile(get_bf_path())
+
+"""
+    download_bioformats!(; version="6.5.1", dest=default_bf_path(), progress=nothing) -> String
+
+Download `bioformats_package.jar` (GPL v2, published by the Open Microscopy
+Environment) from `downloads.openmicroscopy.org` to `dest`, creating parent
+directories as needed. Downloads to a temporary `.part` file first and renames
+it into place atomically, so an interrupted download never leaves a file
+[`is_available`](@ref) would wrongly accept. Returns `dest`.
+
+`progress`, if given, is passed through to `Downloads.download` as the
+progress callback (see `Downloads.download`'s `progress` keyword).
+"""
+function download_bioformats!(; version::AbstractString="6.5.1", dest::AbstractString=default_bf_path(), progress=nothing)
+    url = "https://downloads.openmicroscopy.org/bio-formats/$version/artifacts/bioformats_package.jar"
+    mkpath(dirname(dest))
+    tmp = dest * ".part"
+    try
+        if progress === nothing
+            Downloads.download(url, tmp)
+        else
+            Downloads.download(url, tmp; progress=progress)
+        end
+        mv(tmp, dest; force=true)
+    finally
+        isfile(tmp) && rm(tmp; force=true)
+    end
+    return dest
+end
 
 function set_memory(memory=1024)
     if memory > 0
@@ -305,12 +380,18 @@ function set_memory(memory=1024)
 end
 
 function __init__()
-    # Configure JavaCall and JVM
-    bfpkg_path = get_bf_path()
+    # Configure static JVM options only. Deliberately does NOT call
+    # `get_bf_path()`/`addClassPath` here: `__init__` runs at module/process
+    # initialization time, which for an app embedding this package in a
+    # PackageCompiler sysimage is *before* the app's own startup code gets a
+    # chance to run (e.g. fixing up `Base.DEPOT_PATH` to a location that
+    # doesn't depend on how the app was launched — `get_bf_path()`'s default
+    # resolves via `Base.DEPOT_PATH[1]`). Resolving the classpath this early
+    # can silently freeze in a stale/wrong path. `get_bf_path()` is instead
+    # resolved lazily in `init()`, right before the JVM actually launches.
     JavaCall.addOpts("-ea")
     JavaCall.addOpts("-Xrs")
     set_memory()
-    JavaCall.addClassPath(bfpkg_path)
 end
 
 let initialized = Ref(false)
@@ -318,6 +399,7 @@ let initialized = Ref(false)
     function init(;memory::Int=-1, log_level::String="ERROR")
         if !initialized[]
             if !JavaCall.isloaded()
+                JavaCall.addClassPath(get_bf_path())
                 set_memory(memory)
                 JavaCall.init()
                 atexit(JavaCall.destroy)
