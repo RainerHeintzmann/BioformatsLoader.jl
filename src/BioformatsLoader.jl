@@ -169,15 +169,23 @@ The keyword argument `subset` allows to only import one or multiple specific set
 and the keyword argument `subidx` allows to import specific ranges of the data (in the `order` as given by the user).
 """
 function bf_import(uri; kwargs...)
-    u = URI(uri)
-    if u.scheme in keys(scheme2importer)
-        scheme2importer[u.scheme](u; kwargs...)
-    else
-        if length(u.scheme) > 1
-            @warn "Unrecognized scheme \"$(u.scheme)\", attempting to open as file"
+    # Bio-Formats accepts both local file paths and remote URLs (http/https).
+    # A local path is not a valid URI in general: parsing it with `URI(...)`
+    # throws for any path containing a space or control character ("raw
+    # whitespace" — RFC 3986), and even a plain Windows path without spaces
+    # risks its drive letter ("C:") being misparsed as a URI scheme. So only
+    # attempt URI parsing when `uri` actually looks like `<scheme>://...`;
+    # anything else (including every local path) goes straight to
+    # `bf_import_file`, exactly as it would have if `URI(uri)` had "succeeded"
+    # with an unrecognized/empty scheme.
+    if occursin(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", uri)
+        u = URI(uri)
+        if u.scheme in keys(scheme2importer)
+            return scheme2importer[u.scheme](u; kwargs...)
         end
-        bf_import_file(uri; kwargs...)
+        @warn "Unrecognized scheme \"$(u.scheme)\", attempting to open as file"
     end
+    bf_import_file(uri; kwargs...)
 end
 
 """
