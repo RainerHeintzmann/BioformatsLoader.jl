@@ -23,6 +23,7 @@ export
     arraydata,
     axisnames,
     get_num_sets,
+    series_info,
     get_RGB_channel_count,
     get_bf_path,
     default_bf_path,
@@ -199,6 +200,78 @@ function get_num_sets(filename::AbstractString)
         metalst = get_elements_by_tagname(root(xml), "Image")
         return length(metalst)
     end
+end
+
+"""
+    series_info(filename::AbstractString; thumbnails=true, time_budget=20.0) -> Vector{Dict{Symbol,Any}}
+
+Describe every series (OME `Image`) in `filename` without reading its pixel data,
+e.g. to let a user choose one from a multi-series file (LIF, CZI, ND2, …). Each
+entry has `:index` (1-based, as `bf_import`'s `subset`), `:name` (the OME image
+name, may be empty), `:size` (`[X, Y, Z, C, T]`), `:dimension_order` (e.g.
+`"XYCZT"`), `:pixel_type` and, with `thumbnails=true`, `:thumbnail`: a
+`(width, height, pixels)` named tuple of 8-bit gray values (x fastest) made by
+Bio-Formats' `openThumbBytes` from the middle Z plane of the first channel and
+time point (or `nothing`). Thumbnails stop once `time_budget` seconds are used
+up, so a file with very many (or very large) series still answers quickly.
+"""
+function series_info(filename::AbstractString; thumbnails::Bool=true, time_budget::Real=20.0)
+    OMEXMLReader(filename) do oxr
+        xml = get_xml(oxr)
+        images = get_elements_by_tagname(root(xml), "Image")
+        t0 = time()
+        out = Vector{Dict{Symbol,Any}}()
+        for (i, img) in enumerate(images)
+            set_series!(oxr, i - 1)
+            d = Dict{Symbol,Any}(
+                :index => i,
+                :name => has_attribute(img, "Name") ? attribute(img, "Name") : "",
+                :size => [get_size(oxr, c) for c in "XYZCT"],
+                :dimension_order => get_dimension_order(oxr),
+                :pixel_type => string(getpixeltype(oxr)),
+            )
+            if thumbnails && time() - t0 < time_budget
+                d[:thumbnail] = try
+                    _series_thumbnail(oxr)
+                catch e
+                    @debug "BioformatsLoader: no thumbnail for series $i" exception = e
+                    nothing
+                end
+            end
+            push!(out, d)
+        end
+        return out
+    end
+end
+
+# 8-bit gray thumbnail of the current series (middle Z plane, first channel and
+# time point), contrast-stretched between the 0.5 % and 99.5 % percentiles.
+function _series_thumbnail(oxr::OMEXMLReader)
+    r = oxr.reader
+    z = get_size(oxr, "Z") ÷ 2
+    idx = jcall(r, "getIndex", jint, (jint, jint, jint), z, 0, 0)
+    w = Int(jcall(r, "getThumbSizeX", jint, ()))
+    h = Int(jcall(r, "getThumbSizeY", jint, ()))
+    bytes = local_frame() do
+        jcall(r, "openThumbBytes", Vector{jbyte}, (jint,), idx)
+    end
+    T = getpixeltype(oxr)
+    vals = reinterpret(T, bytes)
+    islittleendian(oxr) || (vals = ntoh.(vals))
+    n = w * h
+    nrgb = max(1, get_RGB_channel_count(oxr))
+    # RGB thumbnails hold `nrgb` samples per pixel: keep the first one
+    v = nrgb > 1 && length(vals) >= n * nrgb ?
+        (isinterleaved(oxr) ? vals[1:nrgb:n*nrgb] : vals[1:n]) : vals[1:min(n, length(vals))]
+    f = Float32.(v)
+    length(f) == n || return nothing
+    s = sort(filter(isfinite, f))
+    isempty(s) && return nothing
+    lo = s[max(1, round(Int, 0.005 * length(s)))]
+    hi = s[max(1, round(Int, 0.995 * length(s)))]
+    scale = hi > lo ? 255f0 / (hi - lo) : 0f0
+    px = UInt8[isfinite(x) ? round(UInt8, clamp((x - lo) * scale, 0f0, 255f0)) : 0x00 for x in f]
+    return (width=w, height=h, pixels=px)
 end
 
 bf_import_file(uri::URI; kwargs...) = bf_import_file(uri.path; kwargs...)
@@ -402,6 +475,54 @@ function __init__()
     set_memory()
 end
 
+# JavaCall (≤ 0.8.1, upstream master as of 2026-11) keeps one JNI environment per
+# thread in `JNI.ppenv`, indexed by `Threads.threadid()`, but sizes it with
+# `Threads.nthreads()` — the size of the *default* pool only. Since Julia 1.12
+# every session also has an interactive thread (`julia -t 1` = 1 default +
+# 1 interactive thread, ids 1 and 2), so `threadid()` exceeds `nthreads()` and
+# `JNI.attach_threads()` throws a BoundsError right after the JVM was created
+# (it looked like "no Java found"). Every later JNI call made on such a thread
+# would hit the same BoundsError. Repair: size the table by `maxthreadid()` and
+# attach the remaining threads ourselves. No-op where JavaCall got it right.
+function _javacall_init()
+    try
+        JavaCall.init()
+    catch e
+        # The JVM itself is up (only attaching the other threads failed):
+        # repair below. Anything else (no Java, bad options) is a real error.
+        JavaCall.isloaded() || rethrow()
+        @debug "BioformatsLoader: repairing JavaCall's per-thread JNI table" exception = e
+    end
+    _attach_all_threads!()
+end
+
+function _attach_all_threads!()
+    ppenv = JavaCall.JNI.ppenv
+    n = Threads.maxthreadid()
+    length(ppenv) < n && append!(ppenv, fill(Ptr{JavaCall.JNI.JNIEnv}(C_NULL), n - length(ppenv)))
+    attach!() = (tid = Threads.threadid();
+                 ppenv[tid] == C_NULL && JavaCall.JNI.attach_current_thread(Ref(ppenv, tid)))
+    attach!()   # the calling thread (normally the one that created the JVM)
+    # Other threads: best effort. Without JULIA_COPY_STACKS the JVM refuses to
+    # attach threads that run Julia tasks on their own stacks ("Unable to attach
+    # thread id"), and JULIA_COPY_STACKS=1 can hang Julia 1.12 at start-up. That
+    # is fine as long as all JNI calls come from the thread that called `init()`
+    # (DeconvGUI/ImageProcessingGUI run them in a JVM worker loop on the main
+    # task), so a failure here must not make the JVM unusable.
+    failed = Threads.Atomic{Int}(0)
+    Threads.@threads :static for _ in 1:Threads.nthreads()   # one per default-pool thread
+        try
+            attach!()
+        catch e
+            Threads.atomic_add!(failed, 1)
+            @debug "BioformatsLoader: could not attach thread $(Threads.threadid()) to the JVM" exception = e
+        end
+    end
+    failed[] > 0 && @debug "BioformatsLoader: $(failed[]) thread(s) not attached to the JVM; " *
+                           "call Bio-Formats only from thread $(Threads.threadid())."
+    nothing
+end
+
 let initialized = Ref(false)
     global init, ensure_init
     function init(;memory::Int=-1, log_level::String="ERROR")
@@ -409,7 +530,7 @@ let initialized = Ref(false)
             if !JavaCall.isloaded()
                 JavaCall.addClassPath(get_bf_path())
                 set_memory(memory)
-                JavaCall.init()
+                _javacall_init()
                 atexit(JavaCall.destroy)
             else
                 @warn "JavaCall already initialized"
