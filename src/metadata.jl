@@ -86,6 +86,32 @@ function base_type_parser(attribute)
     end
 end
 
-schema_path = joinpath(@__DIR__, "..", "deps", "ome.xsd")
-schema = parse_schema(LightXML.parse_file(schema_path))
+const OME_XSD_VERSION = "2016-06"
+const OME_XSD_URL = "https://www.openmicroscopy.org/Schemas/OME/$OME_XSD_VERSION/ome.xsd"
+schema_path = normpath(joinpath(@__DIR__, "..", "deps", "ome.xsd"))
+
+# The schema is gitignored and normally fetched by deps/build.jl, which Pkg does
+# not run for packages used via `[sources]` paths or `Pkg.develop` on a fresh
+# machine. Fetch it here (at precompile time) when missing, and fall back to an
+# empty schema (attributes stay strings) if that is impossible, e.g. offline.
+function _load_schema(path)
+    if !isfile(path)
+        try
+            mkpath(dirname(path))
+            tmp = path * ".part"
+            Downloads.download(OME_XSD_URL, tmp)
+            mv(tmp, path; force=true)
+            @info "BioformatsLoader: downloaded ome.xsd ($OME_XSD_VERSION) to $path"
+        catch e
+            @warn "BioformatsLoader: $path is missing and could not be downloaded " *
+                  "from $OME_XSD_URL; OME metadata attributes are not type-converted. " *
+                  "Run `Pkg.build(\"BioformatsLoader\")` or place the file there." exception=e
+            return Dict{String,Any}()
+        end
+    end
+    include_dependency(path)   # recompile when the schema file changes
+    return parse_schema(LightXML.parse_file(path))
+end
+
+schema = _load_schema(schema_path)
 
