@@ -421,32 +421,88 @@ resolves to.
 is_available() = isfile(get_bf_path())
 
 """
-    download_bioformats!(; version="6.5.1", dest=default_bf_path(), progress=nothing) -> String
+Bio-Formats version that [`download_bioformats!`](@ref) fetches by default (the
+newest stable release; its classes still run on Java 8).
+"""
+const BIOFORMATS_VERSION = "8.5.0"
+
+"""
+    bioformats_urls(version=BIOFORMATS_VERSION) -> Vector{String}
+
+Where `bioformats_package.jar` of `version` is downloaded from, tried in this order:
+1. OME's Maven repository (`artifacts.openmicroscopy.org`): fixed, versioned file
+   names that build tools depend on, so the most stable source;
+2. the GitHub release of Bio-Formats (`v<version>`, available since about 6.6);
+3. `downloads.openmicroscopy.org` (the link on OME's download page, which has
+   been unavailable at times).
+"""
+bioformats_urls(version::AbstractString=BIOFORMATS_VERSION) = [
+    "https://artifacts.openmicroscopy.org/artifactory/ome.releases/ome/bioformats_package/$version/bioformats_package-$version.jar",
+    "https://github.com/ome/bioformats/releases/download/v$version/bioformats_package.jar",
+    "https://downloads.openmicroscopy.org/bio-formats/$version/artifacts/bioformats_package.jar",
+]
+
+# A complete jar (zip) file: starts with a local file header and has the end of
+# central directory record near its end. Rejects HTML error pages and truncated downloads.
+function _is_complete_jar(path::AbstractString)
+    n = filesize(path)
+    n > 1_000_000 || return false
+    open(path) do io
+        read(io, 4) == UInt8[0x50, 0x4b, 0x03, 0x04] || return false
+        tail = min(n, 66_000)   # the record (22 bytes) is followed by a comment of at most 64 KB
+        seek(io, n - tail)
+        buf = read(io, tail)
+        eocd = UInt8[0x50, 0x4b, 0x05, 0x06]
+        return any(i -> view(buf, i:i+3) == eocd, length(buf)-21:-1:1)
+    end
+end
+
+"""
+    download_bioformats!(; version=BIOFORMATS_VERSION, dest=default_bf_path(), urls=bioformats_urls(version),
+                          progress=nothing, log=nothing) -> String
 
 Download `bioformats_package.jar` (GPL v2, published by the Open Microscopy
-Environment) from `downloads.openmicroscopy.org` to `dest`, creating parent
-directories as needed. Downloads to a temporary `.part` file first and renames
-it into place atomically, so an interrupted download never leaves a file
-[`is_available`](@ref) would wrongly accept. Returns `dest`.
+Environment) to `dest`, creating parent directories as needed. The `urls` are
+tried in order (see [`bioformats_urls`](@ref)) until one delivers a complete jar;
+if all fail, the error lists every URL with its error. Downloads to a temporary
+`.part` file first and renames it into place, so an interrupted download never
+leaves a file [`is_available`](@ref) would wrongly accept. Returns `dest`.
 
 `progress`, if given, is passed through to `Downloads.download` as the
-progress callback (see `Downloads.download`'s `progress` keyword).
+progress callback (see `Downloads.download`'s `progress` keyword). `log`, if
+given, is called with a message string before each attempt and after a failed one.
 """
-function download_bioformats!(; version::AbstractString="6.5.1", dest::AbstractString=default_bf_path(), progress=nothing)
-    url = "https://downloads.openmicroscopy.org/bio-formats/$version/artifacts/bioformats_package.jar"
+function download_bioformats!(; version::AbstractString=BIOFORMATS_VERSION, dest::AbstractString=default_bf_path(),
+                              urls=bioformats_urls(version), progress=nothing, log=nothing)
+    say(msg) = log === nothing ? @info(msg) : log(msg)
     mkpath(dirname(dest))
     tmp = dest * ".part"
+    failures = String[]
     try
-        if progress === nothing
-            Downloads.download(url, tmp)
-        else
-            Downloads.download(url, tmp; progress=progress)
+        for url in urls
+            say("Downloading Bio-Formats $version from $url ...")
+            try
+                if progress === nothing
+                    Downloads.download(url, tmp)
+                else
+                    Downloads.download(url, tmp; progress=progress)
+                end
+                _is_complete_jar(tmp) || error("not a complete jar file ($(filesize(tmp)) bytes)")
+                mv(tmp, dest; force=true)
+                return dest
+            catch e
+                e isa InterruptException && rethrow()
+                msg = sprint(showerror, e)
+                push!(failures, "$url: $msg")
+                say("  failed: $msg")
+                isfile(tmp) && rm(tmp; force=true)
+            end
         end
-        mv(tmp, dest; force=true)
     finally
         isfile(tmp) && rm(tmp; force=true)
     end
-    return dest
+    error("Could not download bioformats_package.jar (Bio-Formats $version) from any source:\n  " *
+          join(failures, "\n  ") * "\nPlace it by hand at $dest instead (then restart).")
 end
 
 function set_memory(memory=1024)

@@ -11,10 +11,25 @@ download(xsd_url, joinpath(pwd(), "ome.xsd"))
 # call `BioformatsLoader.download_bioformats!()` / set `BIOFORMATS_JAR_PATH` at
 # runtime instead.
 if get(ENV, "BIOFORMATS_AUTO_DOWNLOAD", "") == "true"
-    version = "6.5.1"
-    bfpkg_url = "https://downloads.openmicroscopy.org/bio-formats/$version/artifacts/bioformats_package.jar"
-    @info "Downloading version $version of bioformats_package.jar from $bfpkg_url"
-    download(bfpkg_url, joinpath(pwd(), "bioformats_package.jar"))
+    # (the same version and sources as `BioformatsLoader.download_bioformats!()`)
+    version = "8.5.0"
+    bfpkg_urls = [
+        "https://artifacts.openmicroscopy.org/artifactory/ome.releases/ome/bioformats_package/$version/bioformats_package-$version.jar",
+        "https://github.com/ome/bioformats/releases/download/v$version/bioformats_package.jar",
+        "https://downloads.openmicroscopy.org/bio-formats/$version/artifacts/bioformats_package.jar",
+    ]
+    ok = false
+    for bfpkg_url in bfpkg_urls
+        @info "Downloading version $version of bioformats_package.jar from $bfpkg_url"
+        try
+            download(bfpkg_url, joinpath(pwd(), "bioformats_package.jar"))
+            global ok = true
+            break
+        catch e
+            @warn "Download failed" bfpkg_url exception = e
+        end
+    end
+    ok || error("Could not download bioformats_package.jar from any of: " * join(bfpkg_urls, ", "))
 else
     @info "Skipping bioformats_package.jar download (GPL-licensed). Set ENV[\"BIOFORMATS_AUTO_DOWNLOAD\"]=\"true\" before Pkg.build to restore the old behavior, or fetch it at runtime via BioformatsLoader.download_bioformats!() / BIOFORMATS_JAR_PATH."
 end
