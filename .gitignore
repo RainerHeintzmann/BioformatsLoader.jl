@@ -8,3 +8,4 @@
 *.swo
 *.log
 deps/ome.xsd
+.DS_Store
