@@ -579,6 +579,14 @@ function _attach_all_threads!()
     nothing
 end
 
+# `DestroyJavaVM` blocks until the calling thread is the last one attached to the
+# JVM. With more than one Julia thread (Julia 1.12 always adds an interactive
+# one) the other attached threads never detach, so destroying the JVM at exit
+# hung the process forever after the script/app had finished (and output still
+# buffered in a redirected stdout was lost). The OS frees the JVM when the
+# process ends anyway, so only destroy it when that cannot block.
+_destroy_jvm_at_exit() = (Threads.maxthreadid() == 1 && JavaCall.isloaded() && JavaCall.destroy(); nothing)
+
 let initialized = Ref(false)
     global init, ensure_init
     function init(;memory::Int=-1, log_level::String="ERROR")
@@ -587,7 +595,7 @@ let initialized = Ref(false)
                 JavaCall.addClassPath(get_bf_path())
                 set_memory(memory)
                 _javacall_init()
-                atexit(JavaCall.destroy)
+                atexit(_destroy_jvm_at_exit)
             else
                 @warn "JavaCall already initialized"
             end
